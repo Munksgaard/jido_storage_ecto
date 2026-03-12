@@ -535,7 +535,7 @@ defmodule Jido.Storage.EctoTest do
     end
 
     test "missing :repo option returns error" do
-      # The raise is caught by the rescue clause, so we get {:error, %ArgumentError{}}
+      # repo/1 returns {:error, %ArgumentError{}} which propagates via the with chain
       assert {:error, %ArgumentError{}} = EctoStorage.get_checkpoint(:some_key, [])
       assert {:error, %ArgumentError{}} = EctoStorage.put_checkpoint(:k, %{}, [])
       assert {:error, %ArgumentError{}} = EctoStorage.load_thread("t", [])
@@ -671,8 +671,10 @@ defmodule Jido.Storage.EctoTest do
   # ===========================================================================
 
   describe "delete_thread error handling" do
-    test "delete_thread returns error when repo is invalid" do
-      assert {:error, _} = EctoStorage.delete_thread("some-thread", repo: NonExistentRepo)
+    test "delete_thread raises when repo is invalid" do
+      assert_raise UndefinedFunctionError, fn ->
+        EctoStorage.delete_thread("some-thread", repo: NonExistentRepo)
+      end
     end
   end
 
@@ -783,10 +785,13 @@ defmodule Jido.Storage.EctoTest do
 
       results = Task.await_many(tasks, 10_000)
 
-      # Both should succeed (they serialize via advisory lock)
+      # Both should complete without crashing. The append may return :not_found
+      # if the delete's transaction commits between the append's write transaction
+      # and its subsequent load_thread reload.
       assert Enum.all?(results, fn
                :ok -> true
                {:ok, _} -> true
+               :not_found -> true
                _ -> false
              end)
 
@@ -875,12 +880,16 @@ defmodule Jido.Storage.EctoTest do
   # ===========================================================================
 
   describe "non-string thread_id" do
-    test "nil thread_id produces an error" do
-      assert {:error, _} = EctoStorage.append_thread(nil, [%{kind: :note}], opts())
+    test "nil thread_id raises" do
+      assert_raise ArgumentError, fn ->
+        EctoStorage.append_thread(nil, [%{kind: :note}], opts())
+      end
     end
 
-    test "integer thread_id produces an error" do
-      assert {:error, _} = EctoStorage.append_thread(123, [%{kind: :note}], opts())
+    test "integer thread_id raises" do
+      assert_raise Ecto.Query.CastError, fn ->
+        EctoStorage.append_thread(123, [%{kind: :note}], opts())
+      end
     end
   end
 
@@ -929,8 +938,10 @@ defmodule Jido.Storage.EctoTest do
   # ===========================================================================
 
   describe "delete error paths" do
-    test "delete_checkpoint returns error when repo is invalid" do
-      assert {:error, _} = EctoStorage.delete_checkpoint(:k, repo: NonExistentRepo)
+    test "delete_checkpoint raises when repo is invalid" do
+      assert_raise UndefinedFunctionError, fn ->
+        EctoStorage.delete_checkpoint(:k, repo: NonExistentRepo)
+      end
     end
   end
 

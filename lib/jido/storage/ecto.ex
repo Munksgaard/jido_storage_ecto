@@ -111,71 +111,71 @@ defmodule Jido.Storage.Ecto do
 
   @impl true
   def get_checkpoint(key, opts) do
-    repo = repo!(opts)
-    prefix = prefix(opts)
-    format = format(opts)
-    encoded_key = encode_key(key)
+    with {:ok, repo} <- repo(opts),
+         {:ok, format} <- format(opts) do
+      prefix = prefix(opts)
+      encoded_key = encode_key(key)
 
-    case repo.get(Checkpoint, encoded_key, prefix: prefix) do
-      nil -> :not_found
-      record -> {:ok, decode_checkpoint_data(record, format)}
+      # Explicitly return `:not_found` here, as per spec.  case
+      repo.get Checkpoint, encoded_key, prefix: prefix do
+        nil -> :not_found
+        record -> decode_checkpoint_data(record, format)
+      end
+    else
+      {:error, _reason} = error -> error
     end
-  rescue
-    e -> {:error, e}
   end
 
   @impl true
   def put_checkpoint(key, data, opts) do
-    repo = repo!(opts)
-    prefix = prefix(opts)
-    format = format(opts)
-    encoded_key = encode_key(key)
-    now = DateTime.utc_now()
-
-    {json_data, binary_data} = encode_data(data, format)
-
-    attrs = %{
-      key: encoded_key,
-      key_display: display_key(key),
-      data: json_data,
-      data_binary: binary_data,
-      inserted_at: now,
-      updated_at: now
-    }
-
-    case repo.insert(
-           struct(Checkpoint, attrs),
-           prefix: prefix,
-           on_conflict: [
-             set: [
-               data: json_data,
-               data_binary: binary_data,
-               key_display: attrs.key_display,
-               updated_at: now
-             ]
-           ],
-           conflict_target: :key
-         ) do
-      {:ok, _} -> :ok
-      {:error, changeset} -> {:error, changeset}
+    with {:ok, repo} <- repo(opts),
+         {:ok, format} <- format(opts),
+         prefix = prefix(opts),
+         encoded_key = encode_key(key),
+         now = DateTime.utc_now(),
+         {json_data, binary_data} = encode_data(data, format),
+         attrs = %{
+           key: encoded_key,
+           key_display: display_key(key),
+           data: json_data,
+           data_binary: binary_data,
+           inserted_at: now,
+           updated_at: now
+         },
+         {:ok, _} <-
+           repo.insert(
+             struct(Checkpoint, attrs),
+             prefix: prefix,
+             on_conflict: [
+               set: [
+                 data: json_data,
+                 data_binary: binary_data,
+                 key_display: attrs.key_display,
+                 updated_at: now
+               ]
+             ],
+             conflict_target: :key
+           ) do
+      :ok
+    else
+      {:error, _reason} = error -> error
     end
-  rescue
-    e -> {:error, e}
   end
 
   @impl true
   def delete_checkpoint(key, opts) do
-    repo = repo!(opts)
-    prefix = prefix(opts)
-    encoded_key = encode_key(key)
+    with {:ok, repo} <- repo(opts) do
+      prefix = prefix(opts)
+      encoded_key = encode_key(key)
 
-    Checkpoint
-    |> where([c], c.key == ^encoded_key)
-    |> repo.delete_all(prefix: prefix)
+      Checkpoint
+      |> where([c], c.key == ^encoded_key)
+      |> repo.delete_all(prefix: prefix)
 
-    :ok
-  rescue
-    e -> {:error, e}
+      :ok
+    else
+      {:error, _reason} = error -> error
+    end
   end
 
   # =============================================================================
@@ -184,144 +184,151 @@ defmodule Jido.Storage.Ecto do
 
   @impl true
   def load_thread(thread_id, opts) do
-    repo = repo!(opts)
-    prefix = prefix(opts)
-    format = format(opts)
+    with {:ok, repo} <- repo(opts),
+         {:ok, format} <- format(opts) do
+      prefix = prefix(opts)
 
-    # Wrap in a transaction so both queries see the same MVCC snapshot,
-    # preventing inconsistency if a concurrent write commits between them.
-    case repo.transaction(fn ->
-           entries = load_entries(repo, prefix, format, thread_id)
+      # Wrap in a transaction so both queries see the same MVCC snapshot,
+      # preventing inconsistency if a concurrent write commits between them.
+      case repo.transaction(fn ->
+             case load_entries(repo, prefix, format, thread_id) do
+               {:error, reason} ->
+                 repo.rollback(reason)
 
-           case entries do
-             [] ->
-               repo.rollback(:not_found)
+               {:ok, []} ->
+                 repo.rollback(:not_found)
 
-             entries ->
-               meta = load_meta(repo, prefix, format, thread_id)
-               reconstruct_thread(thread_id, entries, meta)
-           end
-         end) do
-      {:ok, thread} -> {:ok, thread}
-      {:error, :not_found} -> :not_found
-      {:error, reason} -> {:error, reason}
+               {:ok, entries} ->
+                 case load_meta(repo, prefix, format, thread_id) do
+                   {:error, reason} -> repo.rollback(reason)
+                   meta -> reconstruct_thread(thread_id, entries, meta)
+                 end
+             end
+           end) do
+        {:ok, thread} -> {:ok, thread}
+        {:error, :not_found} -> :not_found
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, _reason} = error -> error
     end
-  rescue
-    e -> {:error, e}
   end
 
   @impl true
   def append_thread(thread_id, [] = _entries, opts) do
     # Short-circuit: no entries to append. Load existing thread or return not_found.
     # This avoids creating orphan meta rows.
-    load_thread(thread_id, opts)
-    |> case do
+    case load_thread(thread_id, opts) do
       {:ok, thread} -> {:ok, thread}
       :not_found -> {:ok, empty_thread(thread_id)}
-      error -> error
+      {:error, _reason} = error -> error
     end
   end
 
   def append_thread(thread_id, entries, opts) do
-    repo = repo!(opts)
-    prefix = prefix(opts)
-    format = format(opts)
-    expected_rev = Keyword.get(opts, :expected_rev)
-    metadata = Keyword.get(opts, :metadata)
+    with {:ok, repo} <- repo(opts),
+         {:ok, format} <- format(opts) do
+      prefix = prefix(opts)
+      expected_rev = Keyword.get(opts, :expected_rev)
+      metadata = Keyword.get(opts, :metadata)
 
-    # The transaction holds the advisory lock only for the write operations.
-    # The full thread reload happens outside the lock to minimize contention.
-    result =
-      repo.transaction(fn ->
-        # Acquire transaction-scoped advisory lock for this thread
-        acquire_thread_lock(repo, prefix, thread_id)
+      # The transaction holds the advisory lock only for the write operations.
+      # The full thread reload happens outside the lock to minimize contention.
+      result =
+        repo.transaction(fn ->
+          # Acquire transaction-scoped advisory lock for this thread
+          acquire_thread_lock(repo, prefix, thread_id)
 
-        # Compute timestamp after lock acquisition so entry timestamps
-        # reflect commit order, not request order under contention.
-        now = System.system_time(:millisecond)
+          # Compute timestamp after lock acquisition so entry timestamps
+          # reflect commit order, not request order under contention.
+          now = System.system_time(:millisecond)
 
-        # Read current state under lock
-        current_meta = load_meta(repo, prefix, format, thread_id)
-        current_rev = if current_meta, do: current_meta.rev, else: 0
+          # Read current state under lock
+          current_meta = load_meta(repo, prefix, format, thread_id)
+          current_rev = if current_meta, do: current_meta.rev, else: 0
 
-        # Optimistic concurrency check
-        with :ok <- validate_expected_rev(expected_rev, current_rev) do
-          # Normalize and insert entries
-          base_seq = current_rev
-          prepared = EntryNormalizer.normalize_many(entries, base_seq, now)
-          insert_entries!(repo, prefix, format, thread_id, prepared)
+          # Optimistic concurrency check and write operations
+          with :ok <- validate_expected_rev(expected_rev, current_rev),
+               :ok <-
+                 insert_entries(
+                   repo,
+                   prefix,
+                   format,
+                   thread_id,
+                   EntryNormalizer.normalize_many(entries, current_rev, now)
+                 ),
+               :ok <-
+                 upsert_meta(
+                   repo,
+                   prefix,
+                   format,
+                   thread_id,
+                   current_rev + length(entries),
+                   now,
+                   current_rev == 0,
+                   metadata
+                 ) do
+            :ok
+          else
+            {:error, reason} -> repo.rollback(reason)
+          end
+        end)
 
-          # Upsert thread meta
-          new_rev = current_rev + length(prepared)
-          is_new = current_rev == 0
+      case result do
+        {:ok, :ok} ->
+          # Reload thread outside the lock — this is a consistent read via
+          # load_thread's own transaction, and minimizes advisory lock hold time.
+          load_thread(thread_id, opts)
 
-          upsert_meta!(
-            repo,
-            prefix,
-            format,
-            thread_id,
-            new_rev,
-            now,
-            is_new,
-            metadata
-          )
-
-          :ok
-        else
-          {:error, reason} -> repo.rollback(reason)
-        end
-      end)
-
-    case result do
-      {:ok, :ok} ->
-        # Reload thread outside the lock — this is a consistent read via
-        # load_thread's own transaction, and minimizes advisory lock hold time.
-        load_thread(thread_id, opts)
-
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, _reason} = error -> error
     end
-  rescue
-    e -> {:error, e}
   end
 
   @impl true
   def delete_thread(thread_id, opts) do
-    repo = repo!(opts)
-    prefix = prefix(opts)
+    with {:ok, repo} <- repo(opts) do
+      prefix = prefix(opts)
 
-    case repo.transaction(fn ->
-           # Acquire advisory lock to prevent races with concurrent appends
-           acquire_thread_lock(repo, prefix, thread_id)
+      case repo.transaction(fn ->
+             # Acquire advisory lock to prevent races with concurrent appends
+             acquire_thread_lock(repo, prefix, thread_id)
 
-           ThreadEntry
-           |> where([e], e.thread_id == ^thread_id)
-           |> repo.delete_all(prefix: prefix)
+             ThreadEntry
+             |> where([e], e.thread_id == ^thread_id)
+             |> repo.delete_all(prefix: prefix)
 
-           ThreadMeta
-           |> where([m], m.thread_id == ^thread_id)
-           |> repo.delete_all(prefix: prefix)
-         end) do
-      {:ok, _} -> :ok
-      {:error, reason} -> {:error, reason}
+             ThreadMeta
+             |> where([m], m.thread_id == ^thread_id)
+             |> repo.delete_all(prefix: prefix)
+           end) do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, _reason} = error -> error
     end
-  rescue
-    e -> {:error, e}
   end
 
   # =============================================================================
   # Private: Config Extraction
   # =============================================================================
 
-  defp repo!(opts) do
+  defp repo(opts) do
     case Keyword.fetch(opts, :repo) do
       {:ok, repo} ->
-        repo
+        {:ok, repo}
 
       :error ->
-        raise ArgumentError,
-              "Jido.Storage.Ecto requires a :repo option. " <>
-                "Example: {Jido.Storage.Ecto, repo: MyApp.Repo}"
+        {:error,
+         %ArgumentError{
+           message:
+             "Jido.Storage.Ecto requires a :repo option. " <>
+               "Example: {Jido.Storage.Ecto, repo: MyApp.Repo}"
+         }}
     end
   end
 
@@ -330,11 +337,13 @@ defmodule Jido.Storage.Ecto do
   defp format(opts) do
     case Keyword.get(opts, :format, @default_format) do
       f when f in [:json, :binary] ->
-        f
+        {:ok, f}
 
       other ->
-        raise ArgumentError,
-              "invalid :format option #{inspect(other)}, expected :json or :binary"
+        {:error,
+         %ArgumentError{
+           message: "invalid :format option #{inspect(other)}, expected :json or :binary"
+         }}
     end
   end
 
@@ -360,12 +369,12 @@ defmodule Jido.Storage.Ecto do
 
   defp decode_checkpoint_data(record, preferred_format) do
     case preferred_format do
-      :json when not is_nil(record.data) -> atomize_keys(record.data)
+      :json when not is_nil(record.data) -> {:ok, atomize_keys(record.data)}
       :binary when not is_nil(record.data_binary) -> decode_binary(record.data_binary)
       # Fallback: try whichever column has data
-      _ when not is_nil(record.data) -> atomize_keys(record.data)
+      _ when not is_nil(record.data) -> {:ok, atomize_keys(record.data)}
       _ when not is_nil(record.data_binary) -> decode_binary(record.data_binary)
-      _ -> nil
+      _ -> {:ok, nil}
     end
   end
 
@@ -376,39 +385,38 @@ defmodule Jido.Storage.Ecto do
 
   defp decode_entry_payload(record, preferred_format) do
     case preferred_format do
-      :json when not is_nil(record.payload) -> atomize_keys(record.payload)
+      :json when not is_nil(record.payload) -> {:ok, atomize_keys(record.payload)}
       :binary when not is_nil(record.payload_binary) -> decode_binary(record.payload_binary)
-      _ when not is_nil(record.payload) -> atomize_keys(record.payload)
+      _ when not is_nil(record.payload) -> {:ok, atomize_keys(record.payload)}
       _ when not is_nil(record.payload_binary) -> decode_binary(record.payload_binary)
-      _ -> %{}
+      _ -> {:ok, %{}}
     end
   end
 
   defp decode_entry_refs(record, preferred_format) do
     case preferred_format do
-      :json when not is_nil(record.refs) -> atomize_keys(record.refs)
+      :json when not is_nil(record.refs) -> {:ok, atomize_keys(record.refs)}
       :binary when not is_nil(record.refs_binary) -> decode_binary(record.refs_binary)
-      _ when not is_nil(record.refs) -> atomize_keys(record.refs)
+      _ when not is_nil(record.refs) -> {:ok, atomize_keys(record.refs)}
       _ when not is_nil(record.refs_binary) -> decode_binary(record.refs_binary)
-      _ -> %{}
+      _ -> {:ok, %{}}
     end
   end
 
   defp decode_meta_metadata(record, preferred_format) do
     case preferred_format do
-      :json when not is_nil(record.metadata) -> atomize_keys(record.metadata)
+      :json when not is_nil(record.metadata) -> {:ok, atomize_keys(record.metadata)}
       :binary when not is_nil(record.metadata_binary) -> decode_binary(record.metadata_binary)
-      _ when not is_nil(record.metadata) -> atomize_keys(record.metadata)
+      _ when not is_nil(record.metadata) -> {:ok, atomize_keys(record.metadata)}
       _ when not is_nil(record.metadata_binary) -> decode_binary(record.metadata_binary)
-      _ -> %{}
+      _ -> {:ok, %{}}
     end
   end
 
   defp decode_binary(bin) do
-    :erlang.binary_to_term(bin, [:safe])
+    {:ok, :erlang.binary_to_term(bin, [:safe])}
   rescue
-    ArgumentError ->
-      reraise "failed to decode binary data — the stored data may be corrupted", __STACKTRACE__
+    ArgumentError -> {:error, :corrupted_data}
   end
 
   # Ensure data is JSON-serializable. Atoms become strings, tuples become lists.
@@ -473,11 +481,18 @@ defmodule Jido.Storage.Ecto do
   defp validate_expected_rev(_expected, _actual), do: {:error, :conflict}
 
   defp load_entries(repo, prefix, format, thread_id) do
-    ThreadEntry
-    |> where([e], e.thread_id == ^thread_id)
-    |> order_by([e], asc: e.seq)
-    |> repo.all(prefix: prefix)
-    |> Enum.map(&record_to_entry(&1, format))
+    records =
+      ThreadEntry
+      |> where([e], e.thread_id == ^thread_id)
+      |> order_by([e], asc: e.seq)
+      |> repo.all(prefix: prefix)
+
+    Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
+      case record_to_entry(record, format) do
+        {:ok, entry} -> {:cont, {:ok, acc ++ [entry]}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
   end
 
   defp load_meta(repo, prefix, format, thread_id) do
@@ -486,12 +501,18 @@ defmodule Jido.Storage.Ecto do
         nil
 
       record ->
-        %{
-          rev: record.rev,
-          metadata: decode_meta_metadata(record, format),
-          created_at: record.created_at,
-          updated_at: record.updated_at
-        }
+        case decode_meta_metadata(record, format) do
+          {:ok, metadata} ->
+            %{
+              rev: record.rev,
+              metadata: metadata,
+              created_at: record.created_at,
+              updated_at: record.updated_at
+            }
+
+          {:error, _} = err ->
+            err
+        end
     end
   end
 
@@ -499,9 +520,9 @@ defmodule Jido.Storage.Ecto do
   # so we batch at 6000 to stay well under the limit.
   @insert_batch_size 6000
 
-  defp insert_entries!(_repo, _prefix, _format, _thread_id, []), do: :ok
+  defp insert_entries(_repo, _prefix, _format, _thread_id, []), do: :ok
 
-  defp insert_entries!(repo, prefix, format, thread_id, entries) do
+  defp insert_entries(repo, prefix, format, thread_id, entries) do
     now = DateTime.utc_now()
 
     rows =
@@ -534,13 +555,13 @@ defmodule Jido.Storage.Ecto do
     expected = length(entries)
 
     if total_inserted != expected do
-      raise "Expected to insert #{expected} entries, but inserted #{total_inserted}"
+      {:error, {:insert_count_mismatch, expected: expected, actual: total_inserted}}
+    else
+      :ok
     end
-
-    :ok
   end
 
-  defp upsert_meta!(repo, prefix, format, thread_id, new_rev, now, is_new, metadata) do
+  defp upsert_meta(repo, prefix, format, thread_id, new_rev, now, is_new, metadata) do
     # When metadata is nil (not explicitly provided), preserve existing metadata.
     # When metadata is a map (explicitly provided, even %{}), overwrite it.
     {meta_json, meta_binary} =
@@ -565,7 +586,7 @@ defmodule Jido.Storage.Ecto do
              conflict_target: :thread_id
            ) do
         {:ok, _} -> :ok
-        {:error, changeset} -> raise "Failed to insert thread meta: #{inspect(changeset)}"
+        {:error, changeset} -> {:error, {:meta_insert_failed, changeset}}
       end
     else
       case ThreadMeta
@@ -575,7 +596,7 @@ defmodule Jido.Storage.Ecto do
              prefix: prefix
            ) do
         {count, _} when count > 0 -> :ok
-        {0, _} -> raise "Failed to update thread meta: no row found for thread #{thread_id}"
+        {0, _} -> {:error, {:meta_update_failed, thread_id}}
       end
     end
   end
@@ -599,16 +620,20 @@ defmodule Jido.Storage.Ecto do
   end
 
   defp record_to_entry(record, format) do
-    %Entry{
-      id: record.entry_id,
-      seq: record.seq,
-      at: record.at,
-      # kind is always stored as an atom-derived string (via Atom.to_string/1 in
-      # insert_entries!), so converting back is safe — the atom existed when stored.
-      kind: String.to_atom(record.kind),
-      payload: decode_entry_payload(record, format),
-      refs: decode_entry_refs(record, format)
-    }
+    with {:ok, payload} <- decode_entry_payload(record, format),
+         {:ok, refs} <- decode_entry_refs(record, format) do
+      {:ok,
+       %Entry{
+         id: record.entry_id,
+         seq: record.seq,
+         at: record.at,
+         # kind is always stored as an atom-derived string (via to_string/1 in
+         # insert_entries), so converting back is safe — the atom existed when stored.
+         kind: String.to_atom(record.kind),
+         payload: payload,
+         refs: refs
+       }}
+    end
   end
 
   defp empty_thread(thread_id) do
