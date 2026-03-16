@@ -116,8 +116,8 @@ defmodule Jido.Storage.Ecto do
       prefix = prefix(opts)
       encoded_key = encode_key(key)
 
-      # Explicitly return `:not_found` here, as per spec.  case
-      repo.get Checkpoint, encoded_key, prefix: prefix do
+      # Explicitly return `:not_found` here, as per spec.
+      case repo.get(Checkpoint, encoded_key, prefix: prefix) do
         nil -> :not_found
         record -> decode_checkpoint_data(record, format)
       end
